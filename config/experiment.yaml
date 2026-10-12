@@ -1,0 +1,28 @@
+seed: 20261003
+samples: 10000
+defects:
+  small_radius_ratio: 1.1
+  medium_area_factor: 1.8
+  large_holes: 3
+  max_attempts: 100
+semigcn:
+  epochs: 100
+  learning_rate: 0.01
+  normal_weight: 4.0
+  multi_scale_weights:
+  - 0.35
+  - 0.3
+  - 0.2
+  - 0.15
+  scheduler_step: 50
+  scheduler_gamma: 0.5
+  dummy_masks: 40
+  neighbourhoods:
+  - 4
+  batch_size: 5
+  smooth_iterations: 30
+  initial_fill_edge_factor: 0.8
+  mask_distance_edge_units: 0.2
+  max_vertices: .inf
+  deterministic: true
+  threads: 4

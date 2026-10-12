@@ -1,0 +1,10 @@
+.venv-experiment/
+__pycache__/
+.pytest_cache/
+*.pyc
+cache/
+results/
+data/damaged/
+data/metadata/
+data/ground_truth/
+experiments/

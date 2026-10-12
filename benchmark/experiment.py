@@ -1,0 +1,300 @@
+"""Full-surface benchmark with SeMIGCN-only original-mesh conditioning."""
+import argparse
+import fcntl
+import time
+import numpy as np
+import pandas as pd
+import yaml
+from .mesh_utils import ROOT,load,save,fill
+from .defects import generate
+from .metrics import evaluate
+
+# One authoritative numbering: historical patient_010=1, remaining IDs sorted.
+PATIENTS=[10,1,2,3,4,5,6,7,8,9,11,12,13,14,15,16,17,18,19,20]
+COLUMNS=['patient','severity','method','repair_assd','repair_hd95','repair_gt_to_pred','repair_pred_to_gt',
+         'repair_normal_error_deg','global_assd','global_hd95','self_intersections','nonmanifold_edges','valid','failure_reason','runtime_seconds']
+
+def prepare_mesh_for_semigcn(original,damaged):
+    """Condition the original in memory, then transfer the existing physical defect."""
+    import ssl  # Load system OpenSSL before MeshLab's bundled libcrypto.
+    import pymeshlab as ml
+    import trimesh
+    from scipy.spatial import cKDTree
+    from scipy.sparse.csgraph import connected_components
+    from .mesh_utils import edges,boundary_cycles,complete_face_graph,topology
+    q=original.copy()
+    if not q.is_watertight:
+        ms=ml.MeshSet();ms.add_mesh(ml.Mesh(q.vertices,q.faces))
+        ms.meshing_repair_non_manifold_edges(method='Split Vertices')
+        ms.meshing_remove_unreferenced_vertices()
+        ms.meshing_repair_non_manifold_vertices(vertdispratio=0)
+        ms.meshing_remove_unreferenced_vertices()
+        q=trimesh.Trimesh(ms.current_mesh().vertex_matrix(),ms.current_mesh().face_matrix(),process=False)
+        _,e,_,count=edges(q);boundary=np.unique(e[count==1]);v=q.vertices.copy()
+        # Separate coincident slit boundaries without smoothing the vessel.
+        delta=np.random.default_rng(0).normal(size=(len(boundary),3))
+        delta/=np.linalg.norm(delta,axis=1)[:,None];v[boundary]+=delta*1e-4
+        ms=ml.MeshSet();ms.add_mesh(ml.Mesh(v,q.faces))
+        def _count_nonmanifold_edges_ms(ms) -> int:
+            m = ms.current_mesh()
+            f = np.asarray(m.face_matrix(), dtype=np.int64)
+
+            if len(f) == 0:
+                return 0
+
+            edges = np.vstack([
+                f[:, [0, 1]],
+                f[:, [1, 2]],
+                f[:, [2, 0]],
+            ])
+            edges = np.sort(edges, axis=1)
+
+            _, counts = np.unique(edges, axis=0, return_counts=True)
+            return int(np.sum(counts > 2))
+
+
+        # ---------------------------------------------------------
+        # Robust manifold repair before hole closing
+        # ---------------------------------------------------------
+
+        # 1. First try the non-destructive variant several times
+        for _ in range(5):
+            n_nm = _count_nonmanifold_edges_ms(ms)
+            if n_nm == 0:
+                break
+
+            ms.meshing_repair_non_manifold_edges(method='Split Vertices')
+            ms.meshing_repair_non_manifold_vertices(vertdispratio=0)
+            ms.meshing_remove_unreferenced_vertices()
+
+        # 2. If some non-manifold edges STILL remain,
+        # remove the minimum-area conflicting faces
+        n_nm = _count_nonmanifold_edges_ms(ms)
+
+        if n_nm > 0:
+            print(
+                f"[SeMIGCN PREP] residual non-manifold edges after split: {n_nm}; "
+                "falling back to Remove Faces",
+                flush=True,
+            )
+
+            ms.meshing_repair_non_manifold_vertices(vertdispratio=0)
+            ms.meshing_repair_non_manifold_edges(method='Remove Faces')
+            ms.meshing_remove_unreferenced_vertices()
+
+        # 3. Verify BEFORE close_holes
+        n_nm = _count_nonmanifold_edges_ms(ms)
+
+        print(
+            f"[SeMIGCN PREP] non-manifold edges before close_holes: {n_nm}",
+            flush=True,
+        )
+
+        if n_nm != 0:
+            raise RuntimeError(
+                f"SeMIGCN preprocessing failed: "
+                f"{n_nm} non-manifold edges remain before close_holes"
+            )
+
+        # 4. Now this filter is allowed to run
+        ms.meshing_close_holes(
+            maxholesize=1000,
+            selfintersection=False,
+            refinehole=False,
+        )
+        q=trimesh.Trimesh(ms.current_mesh().vertex_matrix(),ms.current_mesh().face_matrix(),process=False)
+        loops,bad=boundary_cycles(q)
+        if bad or any(len(loop)!=3 for loop in loops):raise ValueError('Unsupported residual original boundary')
+        # Isolated triangles need a distinct cap, not a duplicate opposite face.
+        vertices=q.vertices.tolist();faces=q.faces.tolist();direct=set(map(tuple,edges(q)[0]))
+        for loop in loops:
+            if (int(loop[0]),int(loop[1])) not in direct:loop=loop[::-1]
+            tri=q.vertices[loop];normal=np.cross(tri[1]-tri[0],tri[2]-tri[0]);normal/=np.linalg.norm(normal)
+            center=len(vertices);vertices.append((tri.mean(0)+normal*1e-4).tolist())
+            faces.extend([[int(b),int(a),center] for a,b in zip(loop,np.roll(loop,-1))])
+        q=trimesh.Trimesh(vertices,faces,process=False)
+    # Tiny components collapse numerically in the unchanged 30-step smoother.
+    # Midpoint subdivision preserves their piecewise-linear surface exactly.
+    _,labels=connected_components(complete_face_graph(q));counts=np.bincount(labels);small=counts[labels]<128
+    if small.any():
+        tiny=q.submesh([np.flatnonzero(small)],append=True)
+        rest=q.submesh([np.flatnonzero(~small)],append=True) if (~small).any() else None
+        for _ in range(3):
+            _,labels=connected_components(complete_face_graph(tiny));counts=np.bincount(labels)
+            selected=np.flatnonzero(counts[labels]<128)
+            if not len(selected):break
+            tiny=trimesh.Trimesh(*trimesh.remesh.subdivide(tiny.vertices,tiny.faces,face_index=selected),process=False)
+        q=trimesh.util.concatenate([rest,tiny]) if rest is not None else tiny
+    # Topology is already closed/manifold; only make face orientation consistent.
+    if not q.is_winding_consistent:
+        f = np.asarray(q.faces, dtype=np.int64).copy()
+
+        edge_incidence = {}
+
+        for fi, face in enumerate(f):
+            a, b, c = map(int, face)
+
+            for u, v in ((a, b), (b, c), (c, a)):
+                key = (min(u, v), max(u, v))
+                direction = 1 if u < v else -1
+
+                edge_incidence.setdefault(key, []).append(
+                    (fi, direction)
+                )
+
+        adjacency = [[] for _ in range(len(f))]
+
+        for edge, incident in edge_incidence.items():
+            if len(incident) != 2:
+                raise ValueError(
+                    f"Orientation repair requires closed manifold: "
+                    f"edge {edge} has {len(incident)} incident faces"
+                )
+
+            (fa, da), (fb, db) = incident
+
+            # If both faces traverse the shared edge in the same
+            # direction, exactly one of them must be flipped.
+            parity = 1 if da == db else 0
+
+            adjacency[fa].append((fb, parity))
+            adjacency[fb].append((fa, parity))
+
+        flip = np.full(len(f), -1, dtype=np.int8)
+
+        for root in range(len(f)):
+            if flip[root] != -1:
+                continue
+
+            flip[root] = 0
+            stack = [root]
+
+            while stack:
+                current = stack.pop()
+
+                for neighbour, parity in adjacency[current]:
+                    expected = int(flip[current]) ^ int(parity)
+
+                    if flip[neighbour] == -1:
+                        flip[neighbour] = expected
+                        stack.append(neighbour)
+
+                    elif int(flip[neighbour]) != expected:
+                        raise ValueError(
+                            "Contradictory orientation constraints"
+                        )
+
+        ids = np.flatnonzero(flip == 1)
+        n_flipped = len(ids)
+
+        if n_flipped:
+            f[ids] = f[ids][:, [0, 2, 1]]
+
+        q = trimesh.Trimesh(
+            vertices=np.asarray(q.vertices).copy(),
+            faces=f,
+            process=False,
+        )
+
+        print(
+            f"[SeMIGCN PREP] orientation repair flipped "
+            f"{n_flipped} faces",
+            flush=True,
+        )
+
+    print(
+        f"[SeMIGCN PREP] winding after orientation repair: "
+        f"{q.is_winding_consistent}",
+        flush=True,
+    )
+
+    finite_ok = bool(np.isfinite(q.vertices).all())
+    topo_q = topology(q)
+    winding_ok = bool(q.is_winding_consistent)
+    min_area = float(np.min(q.area_faces)) if len(q.faces) else float("nan")
+    tiny_faces = int(np.count_nonzero(q.area_faces < 1e-14))
+
+    print(
+        "[SeMIGCN PREP QC] "
+        f"finite={finite_ok} "
+        f"topology={topo_q} "
+        f"winding={winding_ok} "
+        f"min_face_area={min_area:.6e} "
+        f"tiny_faces={tiny_faces}",
+        flush=True,
+    )
+
+    if (
+        not finite_ok
+        or topo_q != (0, 0)
+        or not winding_ok
+        or tiny_faces != 0
+    ):
+        raise ValueError(
+            "Original topology conditioning failed QC: "
+            f"finite={finite_ok}, "
+            f"topology={topo_q}, "
+            f"winding={winding_ok}, "
+            f"min_face_area={min_area:.6e}, "
+            f"tiny_faces={tiny_faces}"
+        )
+    print('Conditioned original:',len(q.vertices),len(q.faces),'boundary/nonmanifold = 0/0',flush=True)
+    # Selection is made once by generate(original,...); never redraw on q.
+    tree=cKDTree(original.vertices);dm=tree.query(damaged.vertices)[1];qm=tree.query(q.vertices)[1]
+    removed={tuple(sorted(f)) for f in original.faces}-{tuple(sorted(f)) for f in dm[damaged.faces]}
+    keep=np.array([tuple(sorted(f)) not in removed for f in qm[q.faces]])
+    if np.count_nonzero(~keep)!=len(removed):raise ValueError('Conditioning changed synthetic patch correspondence')
+    if not np.array_equal(q.vertices[q.faces[~keep]],original.vertices[qm[q.faces[~keep]]]):
+        raise ValueError('Conditioning moved the synthetic patch')
+    faces=q.faces[keep];used=np.unique(faces)
+    result=trimesh.Trimesh(q.vertices[used],np.searchsorted(used,faces),process=False)
+    loops=[]
+    for loop in damaged.metadata['synthetic_loops']:
+        distance,ids=cKDTree(result.vertices).query(damaged.vertices[loop])
+        if np.any(distance!=0):raise ValueError('Conditioning moved synthetic boundary vertices')
+        loops.append(ids.tolist())
+    result.metadata['synthetic_loops']=loops
+    if topology(result)!=(0,sum(map(len,loops))):raise ValueError('Synthetic boundary was not preserved')
+    return result
+
+def run(patients,severities=('small','medium','large'),methods=('L1','L2','SeMIGCN')):
+    cfg=yaml.safe_load((ROOT/'config/experiment.yaml').read_text());out=ROOT/'experiments/rbwh_results';out.mkdir(parents=True,exist_ok=True)
+    with (ROOT/'cache/run.lock').open('w') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        csv=out/'metrics.csv';rows=pd.read_csv(csv,float_precision='round_trip').to_dict('records') if csv.exists() else []
+        # These cached rows never entered a reconstruction method; retry them.
+        rows=[r for r in rows if not (r['patient'] in patients and r['severity'] in severities and r['method'] in methods and ('meshing_close_holes' in str(r.get('failure_reason','')) or str(r.get('failure_reason','')).startswith('incompatible_topology: reference has ')))]
+        rows=[r for r in rows if not (r['patient'] in patients and r['severity'] in severities and r['method'] in methods and r['method']=='SeMIGCN' and r.get('failure_reason') in ('Model vertex resource limit exceeded','Full-surface initialization must be closed and consistently oriented'))]
+        for patient in patients:
+            if not 1<=patient<=20:raise ValueError('Patient number must be1..20')
+            gt=load(ROOT/f'data/RBWH_STL/reference/{patient}.ply')
+            if not (out/f'{patient}_GT.ply').exists():save(gt,out/f'{patient}_GT.ply')
+            for severity in severities:
+                if all(any(r['patient']==patient and r['severity']==severity and r['method']==method for r in rows) for method in methods):continue
+                seed=cfg['seed']+patient*100
+                try:
+                    damaged,roi,size=generate(gt,severity,seed,cfg['defects']);save(damaged,out/f'{patient}_damaged_{severity}.ply')
+                    print(patient,severity,size,flush=True);damage_error=''
+                except Exception as exc:damage_error='defect_generation: '+str(exc)
+                for method in methods:
+                    if any(r['patient']==patient and r['severity']==severity and r['method']==method for r in rows):continue
+                    row={k:np.nan for k in COLUMNS};row.update(patient=patient,severity=severity,method=method,valid=0,failure_reason='');start=time.monotonic();error=None
+                    try:
+                        if damage_error:raise ValueError(damage_error)
+                        if method=='SeMIGCN':
+                            from .semigcn import repair
+                            pred=repair(prepare_mesh_for_semigcn(gt,damaged),cfg['semigcn'],seed)
+                        else:pred=fill(damaged,refine=method=='L2')
+                        if not np.isfinite(pred.vertices).all():raise ValueError('Nonfinite reconstruction')
+                        metrics=evaluate(gt,pred,roi,seed,cfg['samples']);row.update(metrics)
+                        save(pred,out/f'{patient}_{method}_{severity}.ply')
+                        row['valid']=int(metrics['nonmanifold_edges']==0 and metrics['self_intersections']==0)
+                        if not row['valid']:row['failure_reason']='invalid_reconstruction_topology_or_self_intersections'
+                    except Exception as exc:row['failure_reason']=str(exc);error=exc
+                    row['runtime_seconds']=time.monotonic()-start;rows.append(row)
+                    pd.DataFrame(rows,columns=COLUMNS).to_csv(csv,index=False)
+                    print(patient,severity,method,'valid=',row['valid'],row['failure_reason'],flush=True)
+                    if method=='SeMIGCN' and error is not None:raise error
+
+def main():
+    p=argparse.ArgumentParser();p.add_argument('--patients',nargs='+',type=int,default=[2]);a=p.parse_args();run(a.patients)

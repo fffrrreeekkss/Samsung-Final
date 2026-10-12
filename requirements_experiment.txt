@@ -1,0 +1,16 @@
+# Tested isolated CPU environment; original semigcn requirements remain untouched.
+--extra-index-url https://download.pytorch.org/whl/cpu
+numpy==2.2.4
+scipy==1.15.3
+pandas==3.0.6
+trimesh==5.1.0
+pymeshlab==2025.7.post1
+matplotlib==3.10.1
+scikit-image==0.26.0
+torch==2.14.1+cpu
+torch-geometric==2.8.0.post1
+scikit-learn==1.9.1
+rtree==1.4.1
+pytest==9.1.1
+PyYAML==6.0.2
+tqdm==4.67.1
