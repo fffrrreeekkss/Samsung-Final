@@ -27,4 +27,3 @@ python3 -m venv .venv-experiment
 
 Результаты: `experiments/rbwh_results/metrics.csv`.
 
-*Команды рассчитаны на интерфейс `benchmark.experiment.run`; наличие `requirements.txt` и этого интерфейса в текущей версии нужно проверить.*
